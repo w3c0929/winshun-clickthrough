@@ -300,6 +300,39 @@ namespace ClickThrough
         [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT rect);
         [DllImport("user32.dll")] public static extern bool SetProcessDpiAwarenessContext(IntPtr context);
         [DllImport("shcore.dll")] public static extern int SetProcessDpiAwareness(int value);
+
+        // Focus hook: before the click is routed, activate the top-level
+        // window below the click-through window, so the first click also
+        // gives that window (and its control) keyboard focus.
+        [UnmanagedFunctionPointer(CallingConvention.Winapi)]
+        public delegate IntPtr HookProc(int nCode, IntPtr wParam, IntPtr lParam);
+        [StructLayout(LayoutKind.Sequential)]
+        public struct MSLLHOOKSTRUCT { public POINT pt; public uint mouseData; public uint flags; public uint time; public UIntPtr dwExtraInfo; }
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern IntPtr SetWindowsHookEx(int idHook, HookProc lpfn, IntPtr hMod, uint threadId);
+        [DllImport("user32.dll")]
+        public static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
+        [DllImport("user32.dll")]
+        public static extern int GetMessage(out MSG msg, IntPtr hWnd, uint min, uint max);
+        [DllImport("user32.dll")]
+        public static extern IntPtr GetWindow(IntPtr hWnd, uint cmd);
+        [DllImport("user32.dll")]
+        public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
+        [DllImport("kernel32.dll")]
+        public static extern uint GetCurrentThreadId();
+        [DllImport("user32.dll")]
+        public static extern IntPtr SendMessage(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
+        [DllImport("user32.dll")]
+        public static extern short GetAsyncKeyState(int vKey);
+        [StructLayout(LayoutKind.Sequential)]
+        public struct GUITHREADINFO
+        {
+            public int cbSize; public int flags;
+            public IntPtr hwndActive, hwndFocus, hwndCapture, hwndMenuOwner, hwndMoveSize, hwndCaret;
+            public RECT rcCaret;
+        }
+        [DllImport("user32.dll")]
+        public static extern bool GetGUIThreadInfo(uint idThread, ref GUITHREADINFO lpgui);
         [StructLayout(LayoutKind.Sequential)]
         public struct MSG
         {
@@ -538,6 +571,7 @@ namespace ClickThrough
         long m_thumbTarget;
         bool m_failedLogged;
         int m_lastAlpha = -1;
+        bool m_bringToFront = true;
         Thread m_thread;
         ManualResetEventSlim m_ready;
 
@@ -546,7 +580,7 @@ namespace ClickThrough
         // keeps its faded alpha, so it never ends up fully invisible.
         public bool Attach(long target, int alpha)
         {
-            lock (m_lock) { m_target = target; m_alpha = Math.Max(0, Math.Min(255, alpha)); m_failedLogged = false; }
+            lock (m_lock) { m_target = target; m_alpha = Math.Max(0, Math.Min(255, alpha)); m_failedLogged = false; m_bringToFront = true; }
             if (!Ensure()) return false;
             for (int i = 0; i < 50; i++)
             {
@@ -628,6 +662,7 @@ namespace ClickThrough
             if (target == 0 || !Native.IsWindow(t) || !Native.IsWindowVisible(t) || Native.IsIconic(t))
             {
                 if (Native.IsWindowVisible(h)) Native.ShowWindow(h, 0); // SW_HIDE
+                lock (m_lock) m_bringToFront = true;
                 return;
             }
             int cloaked;
@@ -635,6 +670,7 @@ namespace ClickThrough
             {
                 // On another virtual desktop: do not show its thumbnail here.
                 if (Native.IsWindowVisible(h)) Native.ShowWindow(h, 0);
+                lock (m_lock) m_bringToFront = true;
                 return;
             }
             Native.RECT r;
@@ -647,9 +683,16 @@ namespace ClickThrough
             if (w <= 0 || ht <= 0)
             {
                 if (Native.IsWindowVisible(h)) Native.ShowWindow(h, 0);
+                lock (m_lock) m_bringToFront = true;
                 return;
             }
-            Native.SetWindowPos(h, new IntPtr(-1), r.Left, r.Top, w, ht, 0x10); // topmost, no activate
+            // Bring the overlay to the top once per show; on later frames only
+            // move/resize it and leave the Z order alone. Re-asserting topmost
+            // every 25 ms would push it above popup menus and dialogs that are
+            // drawn over the click-through surface.
+            bool bring;
+            lock (m_lock) { bring = m_bringToFront; m_bringToFront = false; }
+            Native.SetWindowPos(h, new IntPtr(-1), r.Left, r.Top, w, ht, bring ? 0x10u : 0x14u); // SWP_NOACTIVATE, + SWP_NOZORDER after the first frame
 
             IntPtr thumb;
             long thumbTarget;
@@ -710,6 +753,18 @@ namespace ClickThrough
 
         NativeOverlay m_overlay;
         int m_lastHotkeyTick;
+
+        readonly object m_focusLock = new object();
+        IntPtr m_focusHook;
+        Thread m_focusThread;
+        Native.HookProc m_focusProc;
+        long m_focusTarget;
+        bool m_focusActive;
+        int m_lastHoverTick;
+        const int WH_MOUSE_LL = 14;
+        const int WM_LBUTTONDOWN = 0x0201, WM_RBUTTONDOWN = 0x0204, WM_MBUTTONDOWN = 0x0207;
+        const int WM_MOUSEMOVE = 0x0200;
+        const int WM_MOUSEWHEEL = 0x020A, WM_MOUSEHWHEEL = 0x020E;
 
         static void Log(string text) { Console.Error.WriteLine("clickthrough: " + text); }
 
@@ -922,6 +977,238 @@ namespace ClickThrough
 
         void HideOverlay() { if (m_overlay != null) m_overlay.Detach(); }
 
+        void SetFocusTarget(long hwnd)
+        {
+            // Always on: whenever a click-through window is tracked, the
+            // window below it becomes current on hover, click or wheel.
+            lock (m_focusLock) { m_focusTarget = hwnd; m_focusActive = hwnd != 0; }
+            if (hwnd != 0) EnsureFocusHook();
+        }
+
+        void EnsureFocusHook()
+        {
+            if (m_focusThread != null) return;
+            m_focusProc = FocusCallback;
+            m_focusThread = new Thread(FocusHookThread);
+            m_focusThread.IsBackground = true;
+            m_focusThread.Start();
+        }
+
+        void FocusHookThread()
+        {
+            m_focusHook = Native.SetWindowsHookEx(WH_MOUSE_LL, m_focusProc, Native.GetModuleHandle(null), 0);
+            if (m_focusHook == IntPtr.Zero)
+            {
+                Log("focus hook failed: " + Marshal.GetLastWin32Error());
+                return;
+            }
+            Native.MSG msg;
+            while (Native.GetMessage(out msg, IntPtr.Zero, 0, 0) > 0)
+            {
+                Native.TranslateMessage(ref msg);
+                Native.DispatchMessage(ref msg);
+            }
+        }
+
+        IntPtr FocusCallback(int nCode, IntPtr wParam, IntPtr lParam)
+        {
+            try
+            {
+                if (nCode >= 0)
+                {
+                    int msg = wParam.ToInt32();
+                    bool down = msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN || msg == WM_MBUTTONDOWN;
+                    bool wheel = msg == WM_MOUSEWHEEL || msg == WM_MOUSEHWHEEL;
+                    bool move = msg == WM_MOUSEMOVE;
+                    if (down || wheel || move)
+                    {
+                        long target;
+                        bool active;
+                        lock (m_focusLock) { target = m_focusTarget; active = m_focusActive; }
+                        if (active && target != 0)
+                        {
+                            var info = (Native.MSLLHOOKSTRUCT)Marshal.PtrToStructure(lParam, typeof(Native.MSLLHOOKSTRUCT));
+                            IntPtr th = new IntPtr(target);
+                            Native.RECT r;
+                            if (Native.IsWindow(th) && Native.GetWindowRect(th, out r)
+                                && info.pt.X >= r.Left && info.pt.X < r.Right
+                                && info.pt.Y >= r.Top && info.pt.Y < r.Bottom)
+                            {
+                                // Only act while the real window is fully invisible;
+                                // the overlay is the visual then.
+                                uint color;
+                                byte alpha = 255;
+                                uint flags = 0;
+                                bool clickThrough = (Native.GetWindowLongPtr(th, -20).ToInt64() & 0x80000) != 0
+                                    && Native.GetLayeredWindowAttributes(th, out color, out alpha, out flags)
+                                    && (flags & 2) != 0 && alpha == 0;
+                                if (!clickThrough) return Native.CallNextHookEx(IntPtr.Zero, nCode, wParam, lParam);
+                                if (move)
+                                {
+                                    int now = Environment.TickCount;
+                                    if (m_lastHoverTick != 0 && unchecked(now - m_lastHoverTick) < 50)
+                                        return Native.CallNextHookEx(IntPtr.Zero, nCode, wParam, lParam);
+                                    m_lastHoverTick = now;
+                                }
+                                IntPtr below = WindowBelow(target, info.pt);
+                                if (below != IntPtr.Zero)
+                                {
+                                    // A popup menu belongs to the window below:
+                                    // activating anything now closes it. Leave the
+                                    // menu in charge until it is dismissed.
+                                    if (MenuOpen() || LeavePointerAlone(below))
+                                        return Native.CallNextHookEx(IntPtr.Zero, nCode, wParam, lParam);
+                                    // Mouse, wheel or hover: the window below becomes
+                                    // current, so clicks, typing and scrolling all act
+                                    // on it without a preliminary focus click.
+                                    ActivateWindow(below);
+                                    if (wheel)
+                                    {
+                                        uint keys = 0;
+                                        if ((Native.GetAsyncKeyState(0x11) & 0x8000) != 0) keys |= 0x0008; // MK_CONTROL
+                                        if ((Native.GetAsyncKeyState(0x10) & 0x8000) != 0) keys |= 0x0004; // MK_SHIFT
+                                        uint wp = (info.mouseData & 0xFFFF0000u) | keys;
+                                        int lp = (info.pt.Y << 16) | (info.pt.X & 0xFFFF);
+                                        Native.SendMessage(below, (uint)msg, new IntPtr(unchecked((int)wp)), new IntPtr(lp));
+                                        return (IntPtr)1; // do not also scroll the window above
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            catch { }
+            return Native.CallNextHookEx(IntPtr.Zero, nCode, wParam, lParam);
+        }
+
+        // While a popup menu is open, moving the mouse must not change the
+        // foreground or the menu closes. GetGUIThreadInfo reports the window
+        // that owns the active menu; #32768 is the native menu class.
+        static bool MenuOpen()
+        {
+            IntPtr fg = Native.GetForegroundWindow();
+            if (fg == IntPtr.Zero) return false;
+            uint pid;
+            uint tid = Native.GetWindowThreadProcessId(fg, out pid);
+            if (tid == 0) return false;
+            var info = new Native.GUITHREADINFO();
+            info.cbSize = Marshal.SizeOf(typeof(Native.GUITHREADINFO));
+            return Native.GetGUIThreadInfo(tid, ref info) && info.hwndMenuOwner != IntPtr.Zero;
+        }
+
+        static bool IsMenuWindow(IntPtr h)
+        {
+            var b = new System.Text.StringBuilder(64);
+            Native.GetClassName(h, b, 64);
+            return b.ToString() == "#32768";
+        }
+
+        // Any popup layer the pointer is over: menus (classic #32768 or drawn
+        // by the app itself), drop-down lists, tooltips. They are top-level
+        // owned windows without a caption, usually WS_POPUP. Activating one or
+        // the window below dismisses it, so the pointer must be left to the
+        // popup until it closes. Dialogs carry a caption and stay ordinary;
+        // windows that cannot take the foreground are never useful targets.
+        static bool LeavePointerAlone(IntPtr h)
+        {
+            if (h == IntPtr.Zero || IsMenuWindow(h)) return true;
+            long ex = Native.GetWindowLongPtr(h, -20).ToInt64();
+            if ((ex & 0x08000000L) != 0) return true;         // WS_EX_NOACTIVATE
+            long style = Native.GetWindowLongPtr(h, -16).ToInt64();
+            if ((style & 0x80000000L) == 0 || (style & 0x00C00000L) != 0)
+                return false;                                 // not a captionless popup
+            if (Native.GetAncestor(h, 3) != h) return true;   // GA_ROOTOWNER: owned popup
+            return (ex & 0x00000080L) != 0;                   // WS_EX_TOOLWINDOW popup (app-drawn menu etc.)
+        }
+
+        static bool IsDesktop(IntPtr h)
+        {
+            string cls = Ct.ClassName(Native.GetAncestor(h, 2).ToInt64());
+            return cls == "Progman" || cls == "WorkerW";
+        }
+
+        // The window directly below the click-through window at `pt`, or zero
+        // when another window is above the click-through surface (do not steal
+        // its focus). Top-level windows are walked in Z order; the overlay and
+        // the tracked window mark the click-through surface.
+        IntPtr WindowBelow(long target, Native.POINT pt)
+        {
+            IntPtr th = new IntPtr(target);
+            if (Native.IsIconic(th)) return IntPtr.Zero;
+            var hits = new List<IntPtr>();
+            Native.EnumWindows(delegate(IntPtr h, IntPtr l)
+            {
+                if (!Native.IsWindowVisible(h)) return true;
+                Native.RECT r;
+                if (!Native.GetWindowRect(h, out r)) return true;
+                if (pt.X >= r.Left && pt.X < r.Right && pt.Y >= r.Top && pt.Y < r.Bottom) hits.Add(h);
+                return true;
+            }, IntPtr.Zero);
+            bool surface = false;
+            foreach (IntPtr h in hits)
+            {
+                if (h == th || OwnWindow(h)) { surface = true; continue; }
+                if (!surface) return IntPtr.Zero; // another window sits above the click-through surface
+                IntPtr below = Native.GetAncestor(h, 2);
+                if (below == IntPtr.Zero) below = h;
+                if (below == th || OwnWindow(below)) continue;
+                return below;
+            }
+            return IntPtr.Zero;
+        }
+
+        static bool OwnWindow(IntPtr h)
+        {
+            uint pid;
+            Native.GetWindowThreadProcessId(h, out pid);
+            return pid == (uint)System.Diagnostics.Process.GetCurrentProcess().Id;
+        }
+
+        static void ActivateWindow(IntPtr h)
+        {
+            if (Native.GetForegroundWindow() == h) return;
+            Native.SetForegroundWindow(h);
+            if (Native.GetForegroundWindow() == h) return;
+            uint fgPid, targetPid;
+            uint fgThread = Native.GetWindowThreadProcessId(Native.GetForegroundWindow(), out fgPid);
+            uint targetThread = Native.GetWindowThreadProcessId(h, out targetPid);
+            uint current = Native.GetCurrentThreadId();
+            if (fgThread == 0 || targetThread == 0 || current == 0 || fgThread == current) return;
+            if (Native.AttachThreadInput(fgThread, current, true))
+            {
+                Native.SetForegroundWindow(h);
+                Native.AttachThreadInput(fgThread, current, false);
+            }
+        }
+
+        // Hand the keyboard to the window below as soon as click-through is
+        // applied: otherwise focus stays on the (now invisible) target until
+        // the pointer first moves over it. The mouse hook keeps hover, click
+        // and wheel going there. Popup layers are not activated (that would
+        // close them) and neither is the desktop.
+        void ActivateBelowNow(long target)
+        {
+            IntPtr t = new IntPtr(target);
+            Native.RECT r;
+            Native.POINT c;
+            if (!Native.GetWindowRect(t, out r)) return;
+            int x, y;
+            if (Native.GetCursorPos(out c) && c.X >= r.Left && c.X < r.Right && c.Y >= r.Top && c.Y < r.Bottom)
+            {
+                x = c.X; y = c.Y;
+            }
+            else
+            {
+                x = (r.Left + r.Right) / 2; y = (r.Top + r.Bottom) / 2;
+            }
+            var pt = new Native.POINT();
+            pt.X = x; pt.Y = y;
+            IntPtr below = WindowBelow(target, pt);
+            if (below == IntPtr.Zero || LeavePointerAlone(below) || IsDesktop(below)) return;
+            ActivateWindow(below);
+        }
+
         bool HotkeyTargetEligible(long hwnd)
         {
             IntPtr h = new IntPtr(hwnd);
@@ -1080,6 +1367,10 @@ namespace ClickThrough
                 Native.SetLayeredWindowAttributes(new IntPtr(applied.Hwnd), 0, 0, 2);
             else
                 Log("DWM thumbnail unavailable; leaving the window faded (clicks may only activate the window below)");
+            SetFocusTarget(applied.Hwnd);
+            // Keyboard goes to the window below right away, not only after the
+            // first mouse move over the click-through surface.
+            ActivateBelowNow(applied.Hwnd);
             result.ok = true;
             result.hwnd = applied.Hwnd;
             result.title = applied.Title;
@@ -1123,6 +1414,7 @@ namespace ClickThrough
         void ClearState()
         {
             HideOverlay();
+            SetFocusTarget(0);
             if (m_tracked != null) Log("state cleared: " + Str(m_tracked["title"]));
             m_tracked = null;
             try { if (File.Exists(StatePath())) File.Delete(StatePath()); }

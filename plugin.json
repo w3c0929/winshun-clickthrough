@@ -6,7 +6,7 @@
     "zh": "点击穿透",
     "en": "Click-through"
   },
-  "version": "1.5.0",
+  "version": "1.5.7",
   "description": {
     "zh": "把窗口变成点击穿透：鼠标点过去落到下面的窗口，同时按设置变淡；再次触发或退出时恢复（复刻 AltSnap 的 ClickThrough）",
     "en": "Make a window click-through: clicks fall to the window below, dimmed by the setting; toggle again or exit to restore (AltSnap's ClickThrough)"
@@ -35,10 +35,10 @@
         "en": "Transparency (%)"
       },
       "hint": {
-        "zh": "和 AltSnap 一样，80 表示明显变淡（不透明度约 20%）；0 不变淡，100 完全看不见",
-        "en": "As in AltSnap: 80 is clearly faded (about 20% opaque); 0 keeps it solid, 100 makes it invisible"
+        "zh": "默认 85，明显变淡（不透明度约 15%）；0 不变淡，100 完全看不见",
+        "en": "Default 85: clearly faded (about 15% opaque); 0 keeps it solid, 100 makes it invisible"
       },
-      "default": 80
+      "default": 85
     },
     {
       "key": "toggleHotkey",
@@ -48,10 +48,10 @@
         "en": "Toggle hotkey"
       },
       "hint": {
-        "zh": "留空则不注册；按下时穿透鼠标下的窗口（见下一项）",
-        "en": "Empty registers nothing; pressing it toggles the window under the mouse (see the next setting)"
+        "zh": "默认 F2；按下时穿透/恢复前台窗口（可在「快捷键作用于鼠标下的窗口」里改为鼠标下的窗口），留空则不注册",
+        "en": "Default F2; pressing it toggles the foreground window (change it to the window under the mouse with the setting below), empty registers nothing"
       },
-      "default": ""
+      "default": "F2"
     },
     {
       "key": "restoreHotkey",
