@@ -1060,18 +1060,11 @@ namespace ClickThrough
                                         return Native.CallNextHookEx(IntPtr.Zero, nCode, wParam, lParam);
                                     // Mouse, wheel or hover: the window below becomes
                                     // current, so clicks, typing and scrolling all act
-                                    // on it without a preliminary focus click.
+                                    // on it without a preliminary focus click. The wheel
+                                    // itself is let through: the system routes it to the
+                                    // window under the pointer (the click-through surface
+                                    // is transparent), so every app scrolls as usual.
                                     ActivateWindow(below);
-                                    if (wheel)
-                                    {
-                                        uint keys = 0;
-                                        if ((Native.GetAsyncKeyState(0x11) & 0x8000) != 0) keys |= 0x0008; // MK_CONTROL
-                                        if ((Native.GetAsyncKeyState(0x10) & 0x8000) != 0) keys |= 0x0004; // MK_SHIFT
-                                        uint wp = (info.mouseData & 0xFFFF0000u) | keys;
-                                        int lp = (info.pt.Y << 16) | (info.pt.X & 0xFFFF);
-                                        Native.SendMessage(below, (uint)msg, new IntPtr(unchecked((int)wp)), new IntPtr(lp));
-                                        return (IntPtr)1; // do not also scroll the window above
-                                    }
                                 }
                             }
                         }
