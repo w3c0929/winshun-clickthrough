@@ -1,0 +1,154 @@
+{
+  "$schema": "https://raw.githubusercontent.com/LingCore/WinShun-plugins/main/schema/plugin.schema.json",
+  "manifest": 1,
+  "id": "w3c0929.clickthrough",
+  "name": {
+    "zh": "点击穿透",
+    "en": "Click-through"
+  },
+  "version": "1.5.0",
+  "description": {
+    "zh": "把窗口变成点击穿透：鼠标点过去落到下面的窗口，同时按设置变淡；再次触发或退出时恢复（复刻 AltSnap 的 ClickThrough）",
+    "en": "Make a window click-through: clicks fall to the window below, dimmed by the setting; toggle again or exit to restore (AltSnap's ClickThrough)"
+  },
+  "author": "w3c0929",
+  "license": "MIT",
+  "minWinShun": "0.23.0",
+  "runtime": {
+    "mode": "resident",
+    "program": "ClickThrough.exe",
+    "timeoutMs": 6000,
+    "idleExitSec": 0,
+    "memoryMB": 256,
+    "start": "eager"
+  },
+  "permissions": [
+    "elevated",
+    "ui"
+  ],
+  "settings": [
+    {
+      "key": "transparency",
+      "type": "number",
+      "title": {
+        "zh": "穿透时透明度 (%)",
+        "en": "Transparency (%)"
+      },
+      "hint": {
+        "zh": "和 AltSnap 一样，80 表示明显变淡（不透明度约 20%）；0 不变淡，100 完全看不见",
+        "en": "As in AltSnap: 80 is clearly faded (about 20% opaque); 0 keeps it solid, 100 makes it invisible"
+      },
+      "default": 80
+    },
+    {
+      "key": "toggleHotkey",
+      "type": "hotkey",
+      "title": {
+        "zh": "切换穿透的快捷键",
+        "en": "Toggle hotkey"
+      },
+      "hint": {
+        "zh": "留空则不注册；按下时穿透鼠标下的窗口（见下一项）",
+        "en": "Empty registers nothing; pressing it toggles the window under the mouse (see the next setting)"
+      },
+      "default": ""
+    },
+    {
+      "key": "restoreHotkey",
+      "type": "hotkey",
+      "title": {
+        "zh": "只恢复的快捷键",
+        "en": "Restore-only hotkey"
+      },
+      "hint": {
+        "zh": "留空不注册；按下只恢复当前穿透窗口，不会对其他窗口开启穿透",
+        "en": "Empty registers nothing; it only restores the current click-through window"
+      },
+      "default": ""
+    },
+    {
+      "key": "feedback",
+      "type": "bool",
+      "title": {
+        "zh": "操作时在底栏提示",
+        "en": "Show a footer notice on toggles"
+      },
+      "hint": {
+        "zh": "用快捷键穿透/恢复时显示一行提示",
+        "en": "Show a line when the hotkey applies or restores"
+      },
+      "default": true
+    },
+    {
+      "key": "useCursor",
+      "type": "bool",
+      "title": {
+        "zh": "快捷键作用于鼠标下的窗口",
+        "en": "The hotkey uses the window under the mouse"
+      },
+      "hint": {
+        "zh": "默认关，和 AltSnap 的 UsePtWindow=0 一致：快捷键作用于前台窗口；打开后改用鼠标下的窗口",
+        "en": "Off by default, like AltSnap's UsePtWindow=0: the hotkey uses the foreground window; turn on to use the window under the mouse"
+      },
+      "default": false
+    },
+    {
+      "key": "maxRows",
+      "type": "number",
+      "title": {
+        "zh": "最多列出",
+        "en": "Rows at most"
+      },
+      "default": 30
+    }
+  ],
+  "commands": [
+    {
+      "id": "toggle",
+      "keyword": [
+        "ct",
+        "穿透",
+        "点击穿透",
+        "clickthrough"
+      ],
+      "title": {
+        "zh": "点击穿透",
+        "en": "Click-through"
+      },
+      "description": {
+        "zh": "列出窗口；Enter 让选中窗口点击穿透或恢复，Ctrl+Enter 恢复当前穿透的窗口",
+        "en": "List windows; Enter toggles click-through on one, Ctrl+Enter restores the one that is click-through"
+      },
+      "icon": "glyph:U+E7F4",
+      "hint": {
+        "zh": "窗口或程序名的一部分；留空列出全部",
+        "en": "part of a window or program name; empty lists all"
+      },
+      "actions": [
+        {
+          "id": "toggle",
+          "title": {
+            "zh": "穿透 / 恢复",
+            "en": "Toggle"
+          },
+          "key": "Enter"
+        },
+        {
+          "id": "restore",
+          "title": {
+            "zh": "恢复穿透的窗口",
+            "en": "Restore the click-through window"
+          },
+          "key": "Ctrl+Enter"
+        }
+      ],
+      "ai": {
+        "description": "List top-level windows with a title (window title and program). Read-only; it does not change any window. Use the action tool to toggle click-through only when the user asks."
+      }
+    }
+  ],
+  "ai": {
+    "expose": true
+  },
+  "homepage": "https://github.com/w3c0929/winshun-clickthrough"
+}
