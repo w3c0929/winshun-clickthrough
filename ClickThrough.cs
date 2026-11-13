@@ -286,12 +286,14 @@ namespace ClickThrough
         [DllImport("dwmapi.dll")] public static extern int DwmUnregisterThumbnail(IntPtr thumb);
         [DllImport("dwmapi.dll")] public static extern int DwmUpdateThumbnailProperties(IntPtr thumb, ref DWM_THUMBNAIL_PROPERTIES props);
         [DllImport("dwmapi.dll")] public static extern int DwmGetWindowAttribute(IntPtr h, int attr, out RECT value, int size);
+        [DllImport("dwmapi.dll")] public static extern int DwmFlush();
 
         [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         public static extern IntPtr CreateWindowExW(uint exStyle, string className, string windowName, uint style,
             int x, int y, int width, int height, IntPtr parent, IntPtr menu, IntPtr instance, IntPtr param);
         [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int cmd);
         [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr h);
+        [DllImport("user32.dll")] public static extern void SwitchToThisWindow(IntPtr h, bool altTab);
         [DllImport("user32.dll")] public static extern bool PeekMessage(out MSG msg, IntPtr hWnd, uint min, uint max, uint remove);
         [DllImport("user32.dll")] public static extern bool TranslateMessage(ref MSG msg);
         [DllImport("user32.dll")] public static extern IntPtr DispatchMessage(ref MSG msg);
@@ -318,6 +320,8 @@ namespace ClickThrough
         public static extern IntPtr GetWindow(IntPtr hWnd, uint cmd);
         [DllImport("user32.dll")]
         public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
+        [DllImport("user32.dll")]
+        public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
         [DllImport("kernel32.dll")]
         public static extern uint GetCurrentThreadId();
         [DllImport("user32.dll")]
@@ -554,6 +558,23 @@ namespace ClickThrough
             IntPtr root = Native.GetAncestor(h, 2);
             return (root != IntPtr.Zero ? root : h).ToInt64();
         }
+
+        public static string WindowTitle(long hwnd) { return TitleOf(new IntPtr(hwnd)); }
+
+        // Undo a modifier + wheel tint: take our WS_EX_LAYERED off again, or
+        // put the alpha back a window that was already layered had.
+        public static void RestoreTint(long hwndLong, long origExStyle, int oldAlpha, string savedClass)
+        {
+            IntPtr h = new IntPtr(hwndLong);
+            if (!Native.IsWindow(h)) return;
+            if (savedClass.Length > 0 && !string.Equals(ClassOf(h), savedClass, StringComparison.OrdinalIgnoreCase)) return;
+            long ex = Style(h);
+            long newEx = ex & ~WS_EX_LAYERED;
+            if ((origExStyle & WS_EX_LAYERED) != 0) newEx |= WS_EX_LAYERED;
+            if (newEx != ex) Native.SetWindowLongPtr(h, GWL_EXSTYLE, new IntPtr(newEx));
+            if ((origExStyle & WS_EX_LAYERED) != 0)
+                Native.SetLayeredWindowAttributes(h, 0, (byte)oldAlpha, LWA_ALPHA);
+        }
     }
 
     // ---- the plugin ----
@@ -597,6 +618,16 @@ namespace ClickThrough
         public void SetAlpha(int alpha)
         {
             lock (m_lock) m_alpha = Math.Max(0, Math.Min(255, alpha));
+        }
+
+        // Same, applied at once on the caller's thread: the swap to the
+        // thumbnail has to happen in the frame the real window disappears.
+        public void SetAlphaNow(int alpha)
+        {
+            alpha = Math.Max(0, Math.Min(255, alpha));
+            IntPtr h;
+            lock (m_lock) { m_alpha = alpha; h = m_hwnd; }
+            if (h != IntPtr.Zero) Native.SetLayeredWindowAttributes(h, 0, (byte)alpha, 2);
         }
 
         public void Detach()
@@ -743,6 +774,21 @@ namespace ClickThrough
         readonly Queue<string> m_queued = new Queue<string>();
         Dictionary<string, object> m_settings = new Dictionary<string, object>();
         Dictionary<string, object> m_tracked;
+        // Windows this plugin made see-through with the modifier + wheel, in
+        // the order they were tinted: what a restore puts back, and what a
+        // click-through of one of them keeps as its visual opacity.
+        readonly List<Dictionary<string, object>> m_tints = new List<Dictionary<string, object>>();
+        int m_visualTint = -1; // the overlay's opacity (%), while a click-through is shown
+
+        // All window changes run on one background thread, in order: the mouse
+        // hook and the hotkey handler only look and post. A window API sent to
+        // a busy window otherwise freezes the hook (the wait cursor) and lets
+        // the state be changed from two threads at once.
+        readonly Queue<Action> m_work = new Queue<Action>();
+        readonly AutoResetEvent m_workSignal = new AutoResetEvent(false);
+        Thread m_worker;
+        int m_workSeq;
+        readonly object m_outLock = new object();
         string m_dataDir = "";
         string m_locale = "zh";
         bool m_hostHotkeys;
@@ -819,8 +865,58 @@ namespace ClickThrough
 
         void Send(Dictionary<string, object> message)
         {
-            m_out.WriteLine(Json.Stringify(message));
-            m_out.Flush();
+            lock (m_outLock)
+            {
+                try
+                {
+                    m_out.WriteLine(Json.Stringify(message));
+                    m_out.Flush();
+                }
+                catch { }
+            }
+        }
+
+        void StartWorker()
+        {
+            if (m_worker != null) return;
+            m_worker = new Thread(delegate()
+            {
+                while (true)
+                {
+                    Action work = null;
+                    lock (m_work) { if (m_work.Count > 0) work = m_work.Dequeue(); }
+                    if (work == null) { m_workSignal.WaitOne(1000); continue; }
+                    int started = Environment.TickCount;
+                    int seq = ++m_workSeq;
+                    Log("work begin #" + seq.ToString(CultureInfo.InvariantCulture));
+                    try { work(); }
+                    catch (Exception e) { Log("work failed #" + seq.ToString(CultureInfo.InvariantCulture) + ": " + e.Message); }
+                    int spent = unchecked(Environment.TickCount - started);
+                    if (spent >= 100) Log("work slow #" + seq.ToString(CultureInfo.InvariantCulture) + ": " + spent + " ms");
+                }
+            });
+            m_worker.IsBackground = true;
+            m_worker.Start();
+        }
+
+        // One serial queue for every window change: no two of them race for
+        // the state or for the same window.
+        void Post(Action work)
+        {
+            lock (m_work) { m_work.Enqueue(work); }
+            m_workSignal.Set();
+        }
+
+        void PostAndWait(Action work)
+        {
+            if (m_worker == null) { work(); return; }
+            var done = new ManualResetEventSlim(false);
+            Post(delegate()
+            {
+                try { work(); }
+                finally { done.Set(); }
+            });
+            done.Wait(5000);
         }
 
         void Reply(object id, Dictionary<string, object> result)
@@ -860,7 +956,16 @@ namespace ClickThrough
                     var caps = Obj(p.ContainsKey("capabilities") ? p["capabilities"] : null);
                     m_hostHotkeys = caps != null && Bool(caps.ContainsKey("hostHotkeys") ? caps["hostHotkeys"] : null, false);
                     Reply(id, Make("protocolVersion", "1", "name", "ClickThrough"));
-                    RestoreTracked(true);
+                    StartWorker();
+                    Log("startup: dataDir=" + m_dataDir);
+                    Post(delegate()
+                    {
+                        Log("startup restore begin");
+                        RestoreTracked(true);
+                        RestoreAllTints();
+                        Log("startup restore end; tints=" + m_tints.Count.ToString(CultureInfo.InvariantCulture));
+                    });
+                    EnsureFocusHook();
                     SyncHotkey();
                     break;
                 }
@@ -873,7 +978,11 @@ namespace ClickThrough
                 case "settingsChanged":
                     m_settings = Obj(p.ContainsKey("settings") ? p["settings"] : null) ?? m_settings;
                     SyncHotkey();
-                    if (m_tracked != null) UpdateOverlayAlpha(VisualAlpha());
+                    if (m_tracked != null)
+                    {
+                        m_visualTint = CurrentOverlayTint();
+                        UpdateOverlayAlpha(TintAlphaOf(m_visualTint));
+                    }
                     break;
                 case "hotkey":
                     DoHotkey(p);
@@ -881,7 +990,7 @@ namespace ClickThrough
                 case "cancel":
                     break;
                 case "shutdown":
-                    RestoreTracked(false);
+                    PostAndWait(delegate() { RestoreTracked(false); RestoreAllTints(); });
                     Reply(id, new Dictionary<string, object>());
                     m_shuttingDown = true;
                     break;
@@ -967,13 +1076,211 @@ namespace ClickThrough
             return (255 * (100 - transparency) + 50) / 100;
         }
 
+        static int TintAlphaOf(int percent)
+        {
+            int t = Math.Max(0, Math.Min(100, percent));
+            return (255 * (100 - t) + 50) / 100;
+        }
+
+        static int TintPercentOf(int alpha)
+        {
+            int t = (int)Math.Round(100 - (alpha * 100 - 50) / 255.0);
+            return Math.Max(0, Math.Min(100, t));
+        }
+
+        // The tint modifier may be one key or a combination ("Ctrl+Shift"):
+        // all of its parts have to be held down for the wheel to be the
+        // tint's. A lone Alt is not offered: it opens the menu bar of most
+        // apps when released, and the wheel then stops scrolling.
+        bool ModifierDown()
+        {
+            string m = Str(m_settings.ContainsKey("tintModifier") ? m_settings["tintModifier"] : null).Trim();
+            if (m.Length == 0 || m == "Alt") m = "Ctrl+Alt";
+            bool any = false;
+            foreach (string part in m.Split('+'))
+            {
+                string key = part.Trim();
+                int vk = key == "Ctrl" ? 0x11 : key == "Shift" ? 0x10 : key == "Alt" ? 0x12 : 0;
+                if (vk == 0) continue;
+                any = true;
+                if ((Native.GetAsyncKeyState(vk) & 0x8000) == 0) return false;
+            }
+            return any;
+        }
+
+        int TintStep()
+        {
+            int step = Int(m_settings.ContainsKey("tintStep") ? m_settings["tintStep"] : null, 5);
+            return Math.Max(1, Math.Min(50, step));
+        }
+
+        Dictionary<string, object> FindTint(long hwnd)
+        {
+            foreach (var t in m_tints)
+                if (Long(t["hwnd"]) == hwnd) return t;
+            return null;
+        }
+
+        // The top-level window under the pointer the tint wheel may change:
+        // not the desktop, the taskbar, the shell or this plugin's own windows.
+        long WindowUnderPoint(Native.POINT pt)
+        {
+            IntPtr h = Native.WindowFromPoint(pt);
+            if (h == IntPtr.Zero) return 0;
+            IntPtr root = Native.GetAncestor(h, 2);
+            if (root != IntPtr.Zero) h = root;
+            if (OwnWindow(h)) return 0;
+            string cls = Ct.ClassName(h.ToInt64());
+            if (cls == "Progman" || cls == "WorkerW" || cls == "Shell_TrayWnd" || cls == "Shell_SecondaryTrayWnd") return 0;
+            if (!HotkeyTargetEligible(h.ToInt64())) return 0;
+            return h.ToInt64();
+        }
+
+        void TintNotice(string text)
+        {
+            bool feedback = Bool(m_settings.ContainsKey("feedback") ? m_settings["feedback"] : null, true);
+            if (feedback) Notify("winshun/notify", Make("text", text));
+        }
+
+        int CurrentOverlayTint()
+        {
+            // A window the user tinted keeps its opacity through click-through;
+            // one never tinted (or wheeled back to 0 %) uses the setting.
+            if (m_tracked != null)
+            {
+                var tint = FindTint(Long(m_tracked["hwnd"]));
+                if (tint != null && Int(tint["t"], 0) > 0)
+                    return Int(tint["t"], Int(m_settings.ContainsKey("transparency") ? m_settings["transparency"] : null, 85));
+            }
+            return Int(m_settings.ContainsKey("transparency") ? m_settings["transparency"] : null, 85);
+        }
+
+        // The wheel with the tint modifier over a window: +-5 %, written to the
+        // window and remembered. True when the wheel belonged to the tint (it
+        // must then not scroll the window).
+        bool AdjustTintUnderPointer(Native.POINT pt, int step)
+        {
+            long hwnd = WindowUnderPoint(pt);
+            if (hwnd == 0) return false;
+            return AdjustTint(hwnd, step);
+        }
+
+        bool AdjustTint(long hwnd, int step)
+        {
+            IntPtr h = new IntPtr(hwnd);
+            if (!Native.IsWindow(h)) return false;
+            bool en = m_locale == "en";
+            var entry = FindTint(hwnd);
+            if (entry != null)
+            {
+                int now = Int(entry["t"], 0);
+                int next = Math.Max(0, Math.Min(100, now + step));
+                if (next == now) return true; // at 0 or 100: the wheel is still ours
+                if (next == 0)
+                {
+                    // Wheeled back to opaque: the window is where it started.
+                    // Forget the tint, so a later F2 uses the setting's
+                    // transparency instead of an opaque overlay that looks
+                    // like "nothing happened".
+                    Ct.RestoreTint(hwnd, Long(entry["exStyle"]), Int(entry["oldAlpha"], 255), Str(entry["class"]));
+                    m_tints.Remove(entry);
+                    SaveState();
+                    TintNotice(L(en, "已恢复不透明度", "Opacity restored"));
+                    return true;
+                }
+                // Alpha 0 would make Windows stop hit-testing the window (a
+                // click would fall behind it); keep one step above it, which
+                // looks the same but stays the window's own click target.
+                int nextAlpha = Math.Max(1, TintAlphaOf(next));
+                entry["t"] = next;
+                entry["alpha"] = nextAlpha;
+                Native.SetLayeredWindowAttributes(h, 0, (byte)nextAlpha, 2);
+                SaveState();
+                TintNotice(L(en, "透明度 " + next + "%", "Opacity " + next + "%"));
+                return true;
+            }
+            long ex = Ct.Style(h);
+            uint color; byte alpha = 255; uint flags = 0;
+            bool haveAlpha = (ex & 0x80000) != 0
+                && Native.GetLayeredWindowAttributes(h, out color, out alpha, out flags) && (flags & 2) != 0;
+            int baseT = haveAlpha && alpha < 255 ? TintPercentOf(alpha) : 0;
+            int want = Math.Max(0, Math.Min(100, baseT + step));
+            int wantAlpha = Math.Max(1, TintAlphaOf(want)); // never alpha 0: it would stop hit-testing
+            long newEx = ex | 0x80000; // WS_EX_LAYERED; not TRANSPARENT: clicks still reach it
+            if (newEx != ex) Native.SetWindowLongPtr(h, -20, new IntPtr(newEx));
+            Native.SetLayeredWindowAttributes(h, 0, (byte)wantAlpha, 2);
+            if ((Ct.Style(h) & 0x80000) == 0) return false; // refused, usually elevated
+            var tint = Make(
+                "hwnd", hwnd.ToString(CultureInfo.InvariantCulture),
+                "exStyle", ex.ToString(CultureInfo.InvariantCulture),
+                "oldAlpha", haveAlpha ? (int)alpha : 255,
+                "t", want,
+                "alpha", wantAlpha,
+                "class", Ct.ClassName(hwnd),
+                "title", Ct.WindowTitle(hwnd));
+            m_tints.Add(tint);
+            SaveState();
+            Log("tint applied: " + Str(tint["title"]) + " " + want + "%");
+            TintNotice(L(en, "透明度 " + want + "%", "Opacity " + want + "%"));
+            return true;
+        }
+
+        // The restore hotkey with no click-through window: put the opacity of
+        // the window under the pointer back the way it was. Returns its title,
+        // or null when there was nothing to restore.
+        string RestoreTintAtCursor()
+        {
+            Native.POINT p;
+            if (!Native.GetCursorPos(out p)) return null;
+            long hwnd = WindowUnderPoint(p);
+            Dictionary<string, object> entry = hwnd != 0 ? FindTint(hwnd) : null;
+            if (entry == null)
+            {
+                // A window tinted to (nearly) nothing is not hit-tested; a
+                // leftover 100 % tint of an older build is not either. Find
+                // the remembered window by its rectangle instead.
+                foreach (var t in m_tints)
+                {
+                    long h = Long(t["hwnd"]);
+                    Native.RECT r;
+                    if (Native.IsWindow(new IntPtr(h)) && Native.GetWindowRect(new IntPtr(h), out r)
+                        && p.X >= r.Left && p.X < r.Right && p.Y >= r.Top && p.Y < r.Bottom)
+                    {
+                        entry = t;
+                        hwnd = h;
+                        break;
+                    }
+                }
+            }
+            if (entry == null) return null;
+            string title = Str(entry["title"]);
+            Ct.RestoreTint(hwnd, Long(entry["exStyle"]), Int(entry["oldAlpha"], 255), Str(entry["class"]));
+            m_tints.Remove(entry);
+            SaveState();
+            Log("tint restored: " + title);
+            return title;
+        }
+
+        void RestoreAllTints()
+        {
+            if (m_tints.Count == 0) return;
+            var copy = new List<Dictionary<string, object>>(m_tints);
+            foreach (var entry in copy)
+            {
+                if (!Ct.WindowExists(Long(entry["hwnd"]))) { m_tints.Remove(entry); continue; }
+                Ct.RestoreTint(Long(entry["hwnd"]), Long(entry["exStyle"]), Int(entry["oldAlpha"], 255), Str(entry["class"]));
+                m_tints.Remove(entry);
+            }
+            SaveState();
+        }
+
         bool ShowOverlay(long hwnd, int visualAlpha)
         {
             if (m_overlay == null) m_overlay = new NativeOverlay();
             return m_overlay.Attach(hwnd, visualAlpha);
         }
 
-        void UpdateOverlayAlpha(int visualAlpha) { if (m_overlay != null) m_overlay.SetAlpha(visualAlpha); }
+        void UpdateOverlayAlpha(int visualAlpha) { if (m_overlay != null) m_overlay.SetAlphaNow(visualAlpha); }
 
         void HideOverlay() { if (m_overlay != null) m_overlay.Detach(); }
 
@@ -1012,6 +1319,7 @@ namespace ClickThrough
 
         IntPtr FocusCallback(int nCode, IntPtr wParam, IntPtr lParam)
         {
+            int started = Environment.TickCount;
             try
             {
                 if (nCode >= 0)
@@ -1020,6 +1328,39 @@ namespace ClickThrough
                     bool down = msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN || msg == WM_MBUTTONDOWN;
                     bool wheel = msg == WM_MOUSEWHEEL || msg == WM_MOUSEHWHEEL;
                     bool move = msg == WM_MOUSEMOVE;
+                    if (wheel && ModifierDown())
+                    {
+                        var wi = (Native.MSLLHOOKSTRUCT)Marshal.PtrToStructure(lParam, typeof(Native.MSLLHOOKSTRUCT));
+                        int delta = (short)((wi.mouseData >> 16) & 0xFFFF);
+                        int amount = TintStep();
+                        int step = delta > 0 ? amount : -amount;
+                        long tintTarget;
+                        bool tintActive;
+                        lock (m_focusLock) { tintTarget = m_focusTarget; tintActive = m_focusActive; }
+                        if (tintActive && tintTarget != 0)
+                        {
+                            Native.RECT tr;
+                            if (Native.IsWindow(new IntPtr(tintTarget)) && Native.GetWindowRect(new IntPtr(tintTarget), out tr)
+                                && wi.pt.X >= tr.Left && wi.pt.X < tr.Right
+                                && wi.pt.Y >= tr.Top && wi.pt.Y < tr.Bottom)
+                            {
+                                // Over the click-through surface: adjust what the
+                                // overlay shows; the window itself is invisible.
+                                if (m_visualTint < 0) m_visualTint = CurrentOverlayTint();
+                                m_visualTint = Math.Max(0, Math.Min(100, m_visualTint + step));
+                                UpdateOverlayAlpha(TintAlphaOf(m_visualTint));
+                                TintNotice(L(m_locale == "en", "透明度 " + m_visualTint + "%", "Opacity " + m_visualTint + "%"));
+                                return (IntPtr)1;
+                            }
+                        }
+                        // The window work can block on a busy window: post it
+                        // and swallow the wheel at once (the tint owns it).
+                        var tintPt = wi.pt;
+                        int tintStep = step;
+                        Post(delegate() { AdjustTintUnderPointer(tintPt, tintStep); });
+                        return (IntPtr)1; // above the posting, not "if it worked": a busy
+                                          // window must not make the pointer wait
+                    }
                     if (down || wheel || move)
                     {
                         long target;
@@ -1064,7 +1405,8 @@ namespace ClickThrough
                                     // itself is let through: the system routes it to the
                                     // window under the pointer (the click-through surface
                                     // is transparent), so every app scrolls as usual.
-                                    ActivateWindow(below);
+                                    long belowHwnd = below.ToInt64();
+                                    Post(delegate() { ActivateWindow(new IntPtr(belowHwnd)); });
                                 }
                             }
                         }
@@ -1072,6 +1414,11 @@ namespace ClickThrough
                 }
             }
             catch { }
+            finally
+            {
+                int spent = unchecked(Environment.TickCount - started);
+                if (spent >= 50) Log("hook slow: " + spent + " ms msg=" + wParam.ToInt32());
+            }
             return Native.CallNextHookEx(IntPtr.Zero, nCode, wParam, lParam);
         }
 
@@ -1163,12 +1510,15 @@ namespace ClickThrough
             if (Native.GetForegroundWindow() == h) return;
             Native.SetForegroundWindow(h);
             if (Native.GetForegroundWindow() == h) return;
+            // No injected Alt tap here: a synthetic Alt press/release reaches
+            // the foreground app and opens its menu bar (Sublime, others),
+            // which then swallows the wheel. Thread input only.
             uint fgPid, targetPid;
             uint fgThread = Native.GetWindowThreadProcessId(Native.GetForegroundWindow(), out fgPid);
             uint targetThread = Native.GetWindowThreadProcessId(h, out targetPid);
             uint current = Native.GetCurrentThreadId();
-            if (fgThread == 0 || targetThread == 0 || current == 0 || fgThread == current) return;
-            if (Native.AttachThreadInput(fgThread, current, true))
+            if (fgThread != 0 && targetThread != 0 && current != 0 && fgThread != current
+                && Native.AttachThreadInput(fgThread, current, true))
             {
                 Native.SetForegroundWindow(h);
                 Native.AttachThreadInput(fgThread, current, false);
@@ -1245,6 +1595,11 @@ namespace ClickThrough
             bool en = m_locale == "en";
             bool feedback = Bool(m_settings.ContainsKey("feedback") ? m_settings["feedback"] : null, true);
 
+            // The window work is slow when a target is busy; keep the hotkey
+            // handler free and let the worker do it in order.
+            Post(delegate()
+            {
+
             // A restore-only hotkey never applies click-through somewhere else.
             if (isRestore && !isToggle)
             {
@@ -1263,8 +1618,15 @@ namespace ClickThrough
                     }
                     ClearState();
                 }
-                Log("hotkey: no click-through to restore");
-                if (feedback) Notify("winshun/notify", Make("text", L(en, "现在没有穿透的窗口", "No click-through window")));
+                string tinted = RestoreTintAtCursor();
+                if (tinted != null)
+                {
+                    Log("hotkey restored tint: " + tinted);
+                    if (feedback) Notify("winshun/notify", Make("text", L(en, "已恢复透明度：" + tinted, "Opacity restored: " + tinted)));
+                    return;
+                }
+                Log("hotkey: no click-through or tint to restore");
+                if (feedback) Notify("winshun/notify", Make("text", L(en, "现在没有穿透或调整过透明度的窗口", "No click-through window and no adjusted opacity")));
                 return;
             }
 
@@ -1306,6 +1668,7 @@ namespace ClickThrough
                 Log("hotkey applied: " + r.title + " hwnd=0x" + r.hwnd.ToString("X") + " class=" + r.cls);
                 if (feedback) Notify("winshun/notify", Make("text", L(en, "已穿透：" + r.title, "Click-through: " + r.title)));
             }
+            });
         }
 
         struct ToggleResult
@@ -1356,8 +1719,19 @@ namespace ClickThrough
             // Visual: an overlay showing a thumbnail at the configured
             // opacity. Input: the real window becomes fully transparent, so
             // clicks reach the window below's controls (address bar etc.).
-            if (ShowOverlay(applied.Hwnd, VisualAlpha()))
+            m_visualTint = CurrentOverlayTint();
+            // The overlay shows its thumbnail at alpha 1 while the real window
+            // is still there (imperceptible), then is flushed. The swap below
+            // lands in one frame: no blank frame, no doubled one.
+            if (ShowOverlay(applied.Hwnd, 1))
+            {
+                // One frame for the thumbnail to reach the screen. Not
+                // DwmFlush: on a busy DWM it can block for seconds, which
+                // shows as the wait cursor while the hotkey seems stuck.
+                Thread.Sleep(30);
                 Native.SetLayeredWindowAttributes(new IntPtr(applied.Hwnd), 0, 0, 2);
+                UpdateOverlayAlpha(TintAlphaOf(m_visualTint));
+            }
             else
                 Log("DWM thumbnail unavailable; leaving the window faded (clicks may only activate the window below)");
             SetFocusTarget(applied.Hwnd);
@@ -1376,16 +1750,34 @@ namespace ClickThrough
             return Path.Combine(m_dataDir, "clickthrough.json");
         }
 
+        bool m_stateRead;
+
         void LoadState()
         {
-            if (m_tracked != null) return;
+            if (m_stateRead) return;
+            m_stateRead = true;
             try
             {
                 string file = StatePath();
                 if (!File.Exists(file)) return;
                 var parsed = Json.Parse(File.ReadAllText(file, Encoding.UTF8)) as Dictionary<string, object>;
-                if (parsed == null || !parsed.ContainsKey("hwnd") || Long(parsed["hwnd"]) == 0) return;
-                m_tracked = parsed;
+                if (parsed == null) return;
+                if (parsed.ContainsKey("tracked") || parsed.ContainsKey("tints"))
+                {
+                    var tracked = Obj(parsed.ContainsKey("tracked") ? parsed["tracked"] : null);
+                    if (tracked != null && tracked.ContainsKey("hwnd") && Long(tracked["hwnd"]) != 0) m_tracked = tracked;
+                    var tints = parsed.ContainsKey("tints") ? parsed["tints"] as List<object> : null;
+                    if (tints != null)
+                        foreach (var item in tints)
+                        {
+                            var tint = Obj(item);
+                            if (tint != null && tint.ContainsKey("hwnd") && Long(tint["hwnd"]) != 0) m_tints.Add(tint);
+                        }
+                }
+                else if (parsed.ContainsKey("hwnd") && Long(parsed["hwnd"]) != 0)
+                {
+                    m_tracked = parsed; // a 1.5 state file: one click-through window
+                }
             }
             catch (Exception e) { Log("state read failed: " + e.Message); }
         }
@@ -1394,10 +1786,18 @@ namespace ClickThrough
         {
             try
             {
+                if (m_tracked == null && m_tints.Count == 0)
+                {
+                    if (File.Exists(StatePath())) File.Delete(StatePath());
+                    return;
+                }
                 if (!Directory.Exists(m_dataDir)) Directory.CreateDirectory(m_dataDir);
                 string path = StatePath();
                 string temp = path + ".tmp";
-                File.WriteAllText(temp, Json.Stringify(m_tracked), new UTF8Encoding(false));
+                var tints = new List<object>();
+                foreach (var tint in m_tints) tints.Add(tint);
+                var state = Make("tracked", m_tracked, "tints", tints);
+                File.WriteAllText(temp, Json.Stringify(state), new UTF8Encoding(false));
                 if (File.Exists(path)) File.Replace(temp, path, null);
                 else File.Move(temp, path);
             }
@@ -1410,15 +1810,14 @@ namespace ClickThrough
             SetFocusTarget(0);
             if (m_tracked != null) Log("state cleared: " + Str(m_tracked["title"]));
             m_tracked = null;
-            try { if (File.Exists(StatePath())) File.Delete(StatePath()); }
-            catch { }
+            m_visualTint = -1;
+            SaveState();
         }
 
         bool RestoreTracked(bool load)
         {
             if (load) LoadState();
             if (m_tracked == null) return false;
-            HideOverlay();
             long hwnd = Long(m_tracked["hwnd"]);
             if (hwnd == 0 || !Ct.WindowExists(hwnd)) { ClearState(); return false; }
             if (load)
@@ -1464,7 +1863,10 @@ namespace ClickThrough
                 IntPtr after = (origEx & 0x8) != 0 ? new IntPtr(-1) : IntPtr.Zero; // HWND_TOPMOST / HWND_TOP
                 Native.SetWindowPos(h, after, 0, 0, 0, 0, 0x1 | 0x2 | 0x40); // NOMOVE, NOSIZE, SHOWWINDOW
                 Native.BringWindowToTop(h);
-                Native.SetForegroundWindow(h);
+                // A hotkey restore has no click to give the foreground: take
+                // it back the way the hover does, with the shell as the last
+                // resort, so typing goes to the window without a click first.
+                ActivateWindow(h);
             }
             catch { }
             ClearState();
@@ -1548,13 +1950,19 @@ namespace ClickThrough
             string action = Str(p.ContainsKey("action") ? p["action"] : null);
             if (action == "restore")
             {
-                bool restored = RestoreTracked(true);
-                Reply(id, Make("effects", new object[]
+                Post(delegate()
                 {
-                    Make("type", "notify", "text", restored ? L(en, "已恢复点击穿透的窗口", "Click-through restored")
-                        : L(en, "现在没有穿透的窗口", "No click-through window")),
-                    Make("type", "hide")
-                }));
+                    bool restored = RestoreTracked(true);
+                    string tinted = restored ? null : RestoreTintAtCursor();
+                    string text = restored ? L(en, "已恢复点击穿透的窗口", "Click-through restored")
+                        : tinted != null ? L(en, "已恢复透明度：" + tinted, "Opacity restored: " + tinted)
+                        : L(en, "现在没有穿透或调整过透明度的窗口", "No click-through window and no adjusted opacity");
+                    Reply(id, Make("effects", new object[]
+                    {
+                        Make("type", "notify", "text", text),
+                        Make("type", "hide")
+                    }));
+                });
                 return;
             }
             if (action != "toggle")
@@ -1570,6 +1978,8 @@ namespace ClickThrough
             var item = Obj(p.ContainsKey("item") ? p["item"] : null);
             var data = item != null ? Obj(item.ContainsKey("data") ? item["data"] : null) : null;
             if (data != null && data.ContainsKey("hwnd")) hwnd = Long(data["hwnd"]);
+            Post(delegate()
+            {
             LoadState();
             if (m_tracked != null)
             {
@@ -1621,6 +2031,7 @@ namespace ClickThrough
                 Make("type", "notify", "text", failure),
                 Make("type", "keep")
             }));
+            });
         }
     }
 

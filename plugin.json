@@ -6,7 +6,7 @@
     "zh": "点击穿透",
     "en": "Click-through"
   },
-  "version": "1.5.9",
+  "version": "1.8.0",
   "description": {
     "zh": "把窗口变成点击穿透：鼠标点过去落到下面的窗口，同时按设置变淡；再次触发或退出时恢复（复刻 AltSnap 的 ClickThrough）",
     "en": "Make a window click-through: clicks fall to the window below, dimmed by the setting; toggle again or exit to restore (AltSnap's ClickThrough)"
@@ -41,6 +41,33 @@
       "default": 85
     },
     {
+      "key": "tintModifier",
+      "type": "choice",
+      "title": {
+        "zh": "调节透明度的修饰键",
+        "en": "Opacity modifier key"
+      },
+      "hint": {
+        "zh": "按住它滚动滚轮，每次把鼠标下窗口的透明度调整一个步进；可以选组合键。默认 Ctrl+Alt。单独的 Alt 会激活多数应用的菜单，不再提供",
+        "en": "Hold it and turn the wheel to change the window under the mouse by one step; combinations work too. Ctrl+Alt by default. A lone Alt opens most apps' menus, so it is not offered"
+      },
+      "options": ["Ctrl", "Shift", "Ctrl+Shift", "Ctrl+Alt"],
+      "default": "Ctrl+Alt"
+    },
+    {
+      "key": "tintStep",
+      "type": "number",
+      "title": {
+        "zh": "每次调整的步进 (%)",
+        "en": "Opacity step (%)"
+      },
+      "hint": {
+        "zh": "滚动一格滚轮调整的百分点，默认 10；可设 1–50",
+        "en": "Percentage points per wheel step, 10 by default; 1–50"
+      },
+      "default": 10
+    },
+    {
       "key": "toggleHotkey",
       "type": "hotkey",
       "title": {
@@ -61,10 +88,10 @@
         "en": "Restore-only hotkey"
       },
       "hint": {
-        "zh": "留空不注册；按下只恢复当前穿透窗口，不会对其他窗口开启穿透",
-        "en": "Empty registers nothing; it only restores the current click-through window"
+        "zh": "默认 F10；留空不注册。按下只恢复当前穿透窗口，不会对其他窗口开启穿透；没有穿透窗口时恢复鼠标下调过透明度的窗口",
+        "en": "F10 by default; empty registers nothing. It only restores the current click-through window, or the tinted window under the mouse when none is click-through"
       },
-      "default": ""
+      "default": "F10"
     },
     {
       "key": "feedback",
