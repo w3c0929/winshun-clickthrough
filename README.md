@@ -82,7 +82,7 @@
 未复刻：
 
 - **Hold 模式**（按住快捷键期间才穿透，松开恢复）：Win顺 插件协议只提供按键“按下”通知，没有按键释放事件。用切换模式代替。
-- AltSnap 的鼠标手势/拖拽触发：本插件只提供 `ct` 查询和宿主热键；鼠标钩子只作为缩略图失败时的后备。
+- AltSnap 的鼠标手势/拖拽触发：本插件只提供 `ct` 查询和宿主热键；鼠标钩子只用于把悬停、点击和滚轮交给下层，并保护下层应用的弹层，不提供拖拽触发。
 - 物理按键序列去抖、按键释放安全网：热键的按下由 Win顺 宿主触发，插件按通知切换。
 
 ## 构建
@@ -93,7 +93,7 @@
 C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /nologo /target:exe /codepage:65001 /out:ClickThrough.exe ClickThrough.cs
 ```
 
-`tests/exe_protocol_test.ps1` 用 JSON-RPC 走一遍 initialize/query/action/shutdown；`tests/exe_toggle_test.ps1` 启动一个测试窗口，验证扩展样式确实写入并恢复；`tests/exe_hook_test.ps1` 验证真实点击穿透到下层；`tests/exe_menu_test.ps1` 验证多层窗口、键盘立即移交、经典菜单与应用自绘弹层不被关闭、覆盖窗口不抢最上层。旧的 `main.ps1` + `WinShun.psm1` 是脚本版实现，当前 manifest 不再引用，保留作参考。
+`tests/exe_protocol_test.ps1` 用 JSON-RPC 走一遍 initialize/query/action/shutdown；`tests/exe_toggle_test.ps1` 启动一个测试窗口，验证扩展样式确实写入并恢复；`tests/exe_hook_test.ps1` 验证真实点击穿透到下层；`tests/exe_menu_test.ps1` 验证多层窗口、键盘立即移交、经典菜单与应用自绘弹层不被关闭、覆盖窗口不抢最上层；`tests/exe_wheel_test.ps1` 用 `tests/WheelSink.cs`（测试时由 csc 编译）验证滚轮直接到达鼠标下的子控件。旧的 `main.ps1` + `WinShun.psm1` 是脚本版实现，当前 manifest 不再引用，保留作参考。
 
 ## 许可证
 
