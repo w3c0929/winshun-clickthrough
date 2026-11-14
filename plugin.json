@@ -3,13 +3,13 @@
   "manifest": 1,
   "id": "w3c0929.clickthrough",
   "name": {
-    "zh": "点击穿透",
+    "zh": "鼠标穿透",
     "en": "Click-through"
   },
-  "version": "1.8.1",
+  "version": "1.8.2",
   "description": {
-    "zh": "把窗口变成点击穿透：鼠标点过去落到下面的窗口，同时按设置变淡；再次触发或退出时恢复（复刻 AltSnap 的 ClickThrough）",
-    "en": "Make a window click-through: clicks fall to the window below, dimmed by the setting; toggle again or exit to restore (AltSnap's ClickThrough)"
+    "zh": "把窗口变成鼠标穿透：鼠标点过去落到下面的窗口，同时按设置变淡；再次触发或退出时恢复",
+    "en": "Make a window click-through: clicks fall to the window below, dimmed by the setting; toggle again or exit to restore"
   },
   "author": "w3c0929",
   "license": "MIT",
@@ -114,8 +114,8 @@
         "en": "The hotkey uses the window under the mouse"
       },
       "hint": {
-        "zh": "默认关，和 AltSnap 的 UsePtWindow=0 一致：快捷键作用于前台窗口；打开后改用鼠标下的窗口",
-        "en": "Off by default, like AltSnap's UsePtWindow=0: the hotkey uses the foreground window; turn on to use the window under the mouse"
+        "zh": "默认关：快捷键作用于前台窗口；打开后改用鼠标下的窗口",
+        "en": "Off by default: the hotkey uses the foreground window; turn on to use the window under the mouse"
       },
       "default": false
     },
@@ -135,15 +135,16 @@
       "keyword": [
         "ct",
         "穿透",
+        "鼠标穿透",
         "点击穿透",
         "clickthrough"
       ],
       "title": {
-        "zh": "点击穿透",
+        "zh": "鼠标穿透",
         "en": "Click-through"
       },
       "description": {
-        "zh": "列出窗口；Enter 让选中窗口点击穿透或恢复，Ctrl+Enter 恢复当前穿透的窗口",
+        "zh": "列出窗口；Enter 让选中窗口鼠标穿透或恢复，Ctrl+Enter 恢复当前穿透的窗口",
         "en": "List windows; Enter toggles click-through on one, Ctrl+Enter restores the one that is click-through"
       },
       "icon": "glyph:U+E7F4",
