@@ -6,7 +6,7 @@
     "zh": "点击穿透",
     "en": "Click-through"
   },
-  "version": "1.8.0",
+  "version": "1.8.1",
   "description": {
     "zh": "把窗口变成点击穿透：鼠标点过去落到下面的窗口，同时按设置变淡；再次触发或退出时恢复（复刻 AltSnap 的 ClickThrough）",
     "en": "Make a window click-through: clicks fall to the window below, dimmed by the setting; toggle again or exit to restore (AltSnap's ClickThrough)"
